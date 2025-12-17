@@ -1,0 +1,881 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+IMU机械臂控制系统 - 主程序入口
+
+功能:
+- 读取三个IMU传感器数据
+- 计算机械臂末端位置
+- 通过ZeroMQ发送到远程B服务器
+- 接收视频/音频反馈
+- 发布调试数据到本地UI
+
+使用方式:
+    python main.py                    # 使用默认配置
+    python main.py --config custom.yaml  # 使用自定义配置
+
+环境:
+    conda activate lerobot
+"""
+
+import sys
+import os
+import signal
+import time
+import threading
+import argparse
+import numpy as np
+from typing import Optional, Dict, Any
+
+# OpenCV for video display
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    print("[main] Warning: OpenCV不可用，视频显示功能将被禁用")
+
+# 添加项目路径
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, PROJECT_ROOT)
+
+from config import config
+from core.imu_handler import IMUHandler
+from core.zmq_manager import ZMQManager
+from core.kinematics import Kinematics
+from core.gripper import GripperController
+from core.audio import AudioReceiver
+from core.video import VideoReceiver
+
+
+class IMUArmController:
+    """
+    IMU机械臂控制器主类
+    
+    整合所有模块，实现完整的控制流程:
+    1. IMU数据读取 -> 运动学计算 -> 发送到B服务器
+    2. 接收视频/音频反馈
+    3. 发布数据到调试UI
+    """
+    
+    # 终端显示常量
+    BOX_WIDTH = 70
+    
+    def __init__(self):
+        """初始化控制器"""
+        self._running = False
+        
+        # 初始化各模块
+        self.imu = IMUHandler()
+        self.zmq = ZMQManager()
+        self.kinematics = Kinematics()
+        self.gripper = GripperController()
+        self.audio = AudioReceiver()
+        self.video = VideoReceiver()
+        
+        # 线程
+        self._publisher_thread: Optional[threading.Thread] = None
+        self._debug_publisher_thread: Optional[threading.Thread] = None
+        self._ui_command_thread: Optional[threading.Thread] = None
+        self._video_thread: Optional[threading.Thread] = None
+        self._audio_thread: Optional[threading.Thread] = None
+        
+        # 当前状态
+        self._current_raw_coords = (0.0, 0.0, 0.0, 0.0, 0.0)
+        self._current_clipped_coords = (0.0, 0.0, 0.0, 0.0, 0.0)
+        self._current_euler = {"imu1": {}, "imu2": {}, "imu3": {}}
+        
+        # 发布间隔
+        self._publish_interval = 1.0 / config.control.publish_rate
+        
+        # 统计
+        self._publish_count = 0
+        self._total_publish_count = 0
+        self._start_time = 0.0
+        self._last_stat_time = 0.0
+        
+        # 终端显示控制
+        self._display_interval = 0.3  # 终端刷新间隔（秒）
+        self._skip_count = 0
+        
+    def setup(self) -> bool:
+        """
+        初始化所有连接
+        
+        Returns:
+            bool: 初始化是否成功
+        """
+        print("=" * 50)
+        print("IMU机械臂控制系统 - 初始化")
+        print("=" * 50)
+        
+        # 连接IMU串口
+        if not self.imu.connect():
+            print("[Warning] IMU串口连接失败，将使用模拟数据")
+            # return False  # 注释掉以允许无IMU运行
+        
+        # 建立ZMQ连接
+        use_tunnel = config.network.ssh_tunnel.enabled
+        if not self.zmq.setup_control_channel(use_tunnel=use_tunnel):
+            print("[Warning] B服务器连接失败，将以离线模式运行")
+        
+        # 设置调试发布器
+        if config.network.debug_ui_enabled:
+            if not self.zmq.setup_debug_publisher():
+                print("[Warning] 调试发布器绑定失败")
+            # 同时设置 UI 命令接收器
+            if not self.zmq.setup_ui_command_receiver():
+                print("[Warning] UI命令接收器绑定失败")
+        
+        # 设置视频接收器
+        if config.network.video.enabled:
+            self.zmq.setup_video_receiver()
+        
+        # 设置音频接收器  
+        if config.network.audio.enabled:
+            self.zmq.setup_audio_receiver()
+        
+        # 设置LeRobot发布器
+        if config.network.lerobot.enabled:
+            self.zmq.setup_lerobot_publisher()
+        
+        print("[OK] 初始化完成")
+        return True
+    
+    def start(self):
+        """启动控制系统"""
+        if self._running:
+            return
+        
+        self._running = True
+        self._start_time = time.time()
+        
+        # 启动IMU读取
+        self.imu.set_callback(self._on_imu_data)
+        self.imu.start()
+        
+        # 启动夹爪控制
+        self.gripper.start()
+        
+        # 启动ZMQ
+        self.zmq.start()
+        
+        # 启动发布线程
+        self._publisher_thread = threading.Thread(
+            target=self._publisher_loop,
+            daemon=True,
+            name="Publisher"
+        )
+        self._publisher_thread.start()
+        
+        # 启动调试发布线程
+        if config.network.debug_ui_enabled:
+            self._debug_publisher_thread = threading.Thread(
+                target=self._debug_publisher_loop,
+                daemon=True,
+                name="DebugPublisher"
+            )
+            self._debug_publisher_thread.start()
+            
+            # 启动 UI 命令接收线程
+            self._ui_command_thread = threading.Thread(
+                target=self._ui_command_loop,
+                daemon=True,
+                name="UICommandReceiver"
+            )
+            self._ui_command_thread.start()
+        
+        # 启动视频接收线程
+        if config.network.video.enabled:
+            self._video_thread = threading.Thread(
+                target=self._video_receiver_loop,
+                daemon=True,
+                name="VideoReceiver"
+            )
+            self._video_thread.start()
+            self.video.start()
+        
+        # 启动音频接收线程
+        if config.network.audio.enabled:
+            self._audio_thread = threading.Thread(
+                target=self._audio_receiver_loop,
+                daemon=True,
+                name="AudioReceiver"
+            )
+            self._audio_thread.start()
+            self.audio.start()
+        
+        # 打印启动信息（借鉴 triple 风格）
+        self._print_startup_banner()
+    
+    def stop(self):
+        """停止控制系统"""
+        print("\n正在停止...")
+        
+        self._running = False
+        
+        # 停止各模块
+        self.imu.stop()
+        self.gripper.stop()
+        self.zmq.stop()
+        self.audio.stop()
+        self.video.stop()
+        
+        # 等待线程结束
+        threads = [
+            self._publisher_thread,
+            self._debug_publisher_thread,
+            self._video_thread,
+            self._audio_thread,
+        ]
+        for t in threads:
+            if t and t.is_alive():
+                t.join(timeout=1.0)
+        
+        # 清理资源
+        self.zmq.cleanup()
+        
+        # 打印最终统计
+        self._print_final_stats()
+    
+    # ==================== 终端显示方法 ====================
+    
+    def _print_startup_banner(self):
+        """打印启动横幅（借鉴 triple 风格）"""
+        W = self.BOX_WIDTH
+        
+        print("\n" + "=" * W)
+        print("🤖 IMU机械臂控制系统 (Modular Full Project)")
+        print("=" * W)
+        print(f"串口设备: {config.imu.serial_port}")
+        print(f"波特率: {config.imu.baudrate}")
+        print(f"IMU 1 (杆1): 地址 0x50 (80)  │  长度: {config.arm.L1*1000:.0f} mm")
+        print(f"IMU 2 (杆2): 地址 0x51 (81)  │  长度: {config.arm.L2*1000:.0f} mm")
+        print(f"IMU 3 (机械爪): 地址 0x52 (82)")
+        print("─" * W)
+        
+        # ZMQ 连接信息
+        print(f"📡 ZMQ 发送到 B 端: tcp://{config.network.b_server.host}:{config.network.b_server.port} (PUSH)")
+        
+        if config.network.lerobot.enabled:
+            print(f"📡 ZMQ 发送到 LeRobot: tcp://{config.network.lerobot.host}:{config.network.lerobot.port} (PUSH)")
+        else:
+            print(f"📡 ZMQ LeRobot: 未启用")
+        
+        if config.network.debug_ui_enabled:
+            print(f"🖥️  调试 UI: tcp://*:{config.network.debug_ui_port} (PUB)")
+        
+        if config.network.video.enabled:
+            print(f"📹 视频接收: tcp://localhost:{config.network.video.port} (SUB)")
+        
+        if config.network.audio.enabled:
+            print(f"🔊 音频接收: tcp://localhost:{config.network.audio.port} (SUB)")
+        
+        print("─" * W)
+        print(f"发布频率: {config.control.publish_rate} Hz (间隔 {1000/config.control.publish_rate:.0f} ms)")
+        print(f"在线检查: {'✅ 启用' if config.control.online_only else '❌ 禁用'}")
+        print("=" * W)
+        print()
+        print("⌨️  键盘控制已启用:")
+        print("    按住 '1' - 夹爪持续打开")
+        print("    按住 '2' - 夹爪持续闭合")
+        print("    按 'q' 或 Ctrl+C - 退出程序")
+        print("=" * W)
+        print()
+        print("⏳ 等待 IMU 数据...")
+        print()
+
+    def _print_final_stats(self):
+        """打印最终统计信息"""
+        elapsed = time.time() - self._start_time
+        avg_rate = self._total_publish_count / elapsed if elapsed > 0 else 0
+        
+        print("\n" + "=" * self.BOX_WIDTH)
+        print("📊 运行统计")
+        print("=" * self.BOX_WIDTH)
+        print(f"  运行时间: {elapsed:.1f} 秒")
+        print(f"  发布次数: {self._total_publish_count}")
+        print(f"  平均发布率: {avg_rate:.1f} Hz")
+        print(f"  跳过次数: {self._skip_count}")
+        print("=" * self.BOX_WIDTH)
+        print("✅ 已安全退出")
+    
+    def _print_status_display(self, euler1: dict, euler2: dict, euler3: dict,
+                               raw_pos: tuple, mapped_pos: tuple, 
+                               gripper_val: float, actual_rate: float):
+        """
+        打印优雅的终端状态显示（借鉴 triple 的风格）
+        
+        使用 Box Drawing 字符和 Emoji 图标
+        """
+        # ANSI 清屏
+        print("\033[H\033[J", end="")
+        
+        W = self.BOX_WIDTH
+        
+        # IMU 在线状态
+        imu1_online = self.imu.is_online(0x50)
+        imu2_online = self.imu.is_online(0x51)
+        imu3_online = self.imu.is_online(0x52)
+        
+        # Yaw 偏移
+        yaw1_offset = self.imu.get_yaw_offset(0x50)
+        yaw2_offset = self.imu.get_yaw_offset(0x51)
+        yaw3_offset = self.imu.get_yaw_offset(0x52)
+        
+        # ========== IMU 1 ==========
+        print("┌" + "─" * W + "┐")
+        print(f"│ IMU 1 (杆1) - 地址: 0x50 (80)  │  长度: {config.arm.L1*1000:.0f} mm".ljust(W+1) + "│")
+        status1 = "✅ 在线" if imu1_online else "⚠️  离线"
+        yaw1_str = f"(偏移:{yaw1_offset:.2f}°)" if yaw1_offset is not None else "(未归零)"
+        print(f"│ 状态: {status1}".ljust(W+1) + "│")
+        print(f"│ Roll = {euler1.get('roll', 0):8.2f}°  │  Pitch = {euler1.get('pitch', 0):8.2f}°  │  Yaw = {euler1.get('yaw', 0):8.2f}° {yaw1_str}".ljust(W+17) + "│")
+        
+        # ========== IMU 2 ==========
+        print("├" + "─" * W + "┤")
+        print(f"│ IMU 2 (杆2) - 地址: 0x51 (81)  │  长度: {config.arm.L2*1000:.0f} mm".ljust(W+1) + "│")
+        status2 = "✅ 在线" if imu2_online else "⚠️  离线"
+        yaw2_str = f"(偏移:{yaw2_offset:.2f}°)" if yaw2_offset is not None else "(未归零)"
+        print(f"│ 状态: {status2}".ljust(W+1) + "│")
+        print(f"│ Roll = {euler2.get('roll', 0):8.2f}°  │  Pitch = {euler2.get('pitch', 0):8.2f}°  │  Yaw = {euler2.get('yaw', 0):8.2f}° {yaw2_str}".ljust(W+17) + "│")
+        
+        # ========== IMU 3 ==========
+        print("├" + "─" * W + "┤")
+        print(f"│ IMU 3 (机械爪) - 地址: 0x52 (82)".ljust(W+1) + "│")
+        status3 = "✅ 在线" if imu3_online else "⚠️  离线"
+        yaw3_str = f"(偏移:{yaw3_offset:.2f}°)" if yaw3_offset is not None else "(未归零)"
+        print(f"│ 状态: {status3}".ljust(W+1) + "│")
+        print(f"│ Roll = {euler3.get('roll', 0):8.2f}°  │  Pitch = {euler3.get('pitch', 0):8.2f}°  │  Yaw = {euler3.get('yaw', 0):8.2f}° {yaw3_str}".ljust(W+17) + "│")
+        print("└" + "─" * W + "┘")
+        
+        # ========== 末端位置 & 发布状态 ==========
+        print()
+        print("┌" + "─" * W + "┐")
+        print(f"│ 🤖 机械臂末端位置 & ZeroMQ 发布状态".ljust(W+2) + "│")
+        print("├" + "─" * W + "┤")
+        print(f"│ 原始位置: [{raw_pos[0]:7.3f}, {raw_pos[1]:7.3f}, {raw_pos[2]:7.3f}] m".ljust(W+1) + "│")
+        print(f"│ 映射位置: [{mapped_pos[0]:7.3f}, {mapped_pos[1]:7.3f}, {mapped_pos[2]:7.3f}] m".ljust(W+1) + "│")
+        
+        # Shoulder Pan 角度
+        shoulder_pan = np.arctan2(raw_pos[1], raw_pos[0])
+        shoulder_pan_deg = np.rad2deg(shoulder_pan)
+        print(f"│ Shoulder Pan: {shoulder_pan_deg:7.2f}° ({shoulder_pan:7.4f} rad)".ljust(W+1) + "│")
+        
+        # 发送姿态（弧度）
+        sent_roll = np.deg2rad(euler3.get('roll', 0))
+        sent_pitch = np.deg2rad(euler3.get('pitch', 0))
+        sent_yaw = np.deg2rad(euler3.get('yaw', 0))
+        print(f"│ 发送姿态: Roll={sent_roll:7.4f}, Pitch={sent_pitch:7.4f}, Yaw={sent_yaw:7.4f} rad".ljust(W+1) + "│")
+        
+        # 夹爪状态（进度条）
+        gripper_percent = gripper_val * 100
+        bar_len = 20
+        filled = int(gripper_val * bar_len)
+        gripper_bar = "█" * filled + "░" * (bar_len - filled)
+        print(f"│ 🦾 夹爪开合: [{gripper_bar}] {gripper_percent:5.1f}%".ljust(W+3) + "│")
+        
+        print("├" + "─" * W + "┤")
+        
+        # 发布统计
+        print(f"│ 📡 发布频率: {actual_rate:.1f} Hz  │  消息计数: {self._total_publish_count}".ljust(W+1) + "│")
+        
+        # ZMQ 连接状态
+        ctrl_status = "✅" if self.zmq.connection_status.get('control') else "❌"
+        debug_status = "✅" if self.zmq.connection_status.get('debug') else "❌"
+        lerobot_status = "✅" if self.zmq.connection_status.get('lerobot') else "⬜"
+        print(f"│ 🔗 连接: B服务器{ctrl_status}  调试UI{debug_status}  LeRobot{lerobot_status}".ljust(W+5) + "│")
+        
+        print("├" + "─" * W + "┤")
+        
+        # 视频状态
+        if config.network.video.enabled:
+            video_frames = getattr(self.video, 'frame_count', 0)
+            print(f"│ 📹 视频: 帧数={video_frames:6d}".ljust(W+1) + "│")
+        else:
+            print(f"│ 📹 视频: 未启用".ljust(W+1) + "│")
+        
+        # 音频状态
+        if config.network.audio.enabled:
+            audio_frames = getattr(self.audio, 'frame_count', 0)
+            print(f"│ 🔊 音频: 帧数={audio_frames:6d}".ljust(W+1) + "│")
+        else:
+            print(f"│ 🔊 音频: 未启用".ljust(W+1) + "│")
+        
+        # 调试UI状态
+        if config.network.debug_ui_enabled:
+            print(f"│ 🖥️  调试UI: 端口 {config.network.debug_ui_port} (PUB)".ljust(W+2) + "│")
+        else:
+            print(f"│ 🖥️  调试UI: 未启用".ljust(W+2) + "│")
+        
+        print("└" + "─" * W + "┘")
+        
+        # 控制提示
+        print()
+        print("─" * W)
+        print("⌨️  控制: 按住'1'打开夹爪 │ 按住'2'闭合夹爪 │ Ctrl+C 退出")
+        print("─" * W)
+    
+    # ==================== 回调和循环 ====================
+    
+    def _on_imu_data(self, address: int, roll: float, pitch: float, yaw: float):
+        """IMU数据回调"""
+        # 由IMU模块自动更新数据，这里可以添加额外处理
+        pass
+    
+    def _publisher_loop(self):
+        """
+        主数据发布循环
+        
+        同时负责:
+        1. 读取IMU数据
+        2. 计算运动学
+        3. 发送到B服务器和LeRobot
+        4. 定期刷新终端显示
+        """
+        self._last_stat_time = time.time()
+        
+        while self._running:
+            loop_start = time.time()
+            
+            try:
+                # ========== 步骤1: 检查IMU在线状态 ==========
+                imu1_online = self.imu.is_online(0x50)
+                imu2_online = self.imu.is_online(0x51)
+                imu3_online = self.imu.is_online(0x52)
+                
+                # 如果启用了 online_only 模式，检查所有 IMU 是否在线
+                if config.control.online_only and not (imu1_online and imu2_online and imu3_online):
+                    self._skip_count += 1
+                    if self._skip_count % 25 == 0:  # 每几秒打印一次
+                        print(f"⚠️  等待IMU在线... IMU1: {'✓' if imu1_online else '✗'}, "
+                              f"IMU2: {'✓' if imu2_online else '✗'}, "
+                              f"IMU3: {'✓' if imu3_online else '✗'} (跳过 {self._skip_count} 次)")
+                    time.sleep(self._publish_interval)
+                    continue
+                
+                # ========== 步骤2: 读取IMU数据 ==========
+                euler1 = {
+                    "roll": self.imu.get_euler(0x50, "roll"),
+                    "pitch": self.imu.get_euler(0x50, "pitch"),
+                    "yaw": self.imu.get_normalized_yaw(0x50),
+                }
+                euler2 = {
+                    "roll": self.imu.get_euler(0x51, "roll"),
+                    "pitch": self.imu.get_euler(0x51, "pitch"),
+                    "yaw": self.imu.get_normalized_yaw(0x51),
+                }
+                euler3 = {
+                    "roll": self.imu.get_euler(0x52, "roll"),
+                    "pitch": self.imu.get_euler(0x52, "pitch"),
+                    "yaw": self.imu.get_normalized_yaw(0x52),
+                }
+                
+                # 保存当前欧拉角（用于显示）
+                self._current_euler = {"imu1": euler1, "imu2": euler2, "imu3": euler3}
+                
+                # ========== 步骤3: 计算末端位置 ==========
+                try:
+                    end_pos, link1_pos, link2_pos = self.kinematics.calculate_end_effector(
+                        euler1, euler2
+                    )
+                except Exception as e:
+                    print(f"⚠️  运动学计算失败: {e}")
+                    end_pos = np.array([0.0, 0.0, 0.0])
+                
+                # 获取夹爪值
+                gripper_value = self.gripper.value
+                
+                # 原始坐标
+                raw_x, raw_y, raw_z = end_pos[0], end_pos[1], end_pos[2]
+                raw_base = euler3["yaw"]
+                
+                self._current_raw_coords = (raw_x, raw_y, raw_z, raw_base, gripper_value)
+                
+                # ========== 步骤4: 坐标映射 ==========
+                mapped = self.kinematics.map_position_with_gripper(
+                    end_pos, raw_base, gripper_value
+                )
+                self._current_clipped_coords = tuple(mapped)
+                
+                # ========== 步骤5: 构建并发送控制数据 ==========
+                control_data = {
+                    "type": "control",
+                    "timestamp": time.time(),
+                    "robot_info": {
+                        "shoulder_pan": float(np.arctan2(raw_y, raw_x)),
+                        "wrist_roll": float(np.deg2rad(euler3["roll"])),
+                        "pitch": float(np.deg2rad(euler3["pitch"])),
+                        "x": float(pow(end_pos[0]*end_pos[0]+end_pos[1]*end_pos[1], 0.5)),
+                        "y": float(end_pos[2]),  # z -> y 坐标系转换
+                        "gripper": float(gripper_value),
+                    },
+                    "coordinates": {
+                        "x": float(pow(mapped[0]*mapped[0]+mapped[1]*mapped[1], 0.5)),
+                        "y": mapped[1],
+                        "z": mapped[2],
+                        "base": mapped[3],
+                        "gripper": mapped[4],
+                    },
+                    "raw": {
+                        "x": raw_x,
+                        "y": raw_y,
+                        "z": raw_z,
+                        "base": raw_base,
+                        "gripper": gripper_value,
+                    },
+                    "imu": {
+                        "imu1": euler1,
+                        "imu2": euler2,
+                        "imu3": euler3,
+                    },
+                    "status": {
+                        "imu1_online": imu1_online,
+                        "imu2_online": imu2_online,
+                        "imu3_online": imu3_online,
+                    }
+                }
+                
+                # 发送到B服务器
+                self.zmq.send_control_data(control_data)
+                
+                # 发送到LeRobot
+                if config.network.lerobot.enabled:
+                    lerobot_data = {
+                        "type": "lerobot",
+                        "timestamp": time.time(),
+                        "position": list(mapped[:3]),
+                        "orientation": [
+                            float(np.deg2rad(euler3["roll"])),
+                            float(np.deg2rad(euler3["pitch"])),
+                            float(np.deg2rad(euler3["yaw"])),
+                        ],
+                        "gripper": float(gripper_value),
+                    }
+                    self.zmq.send_to_lerobot(lerobot_data)
+                
+                self._publish_count += 1
+                self._total_publish_count += 1
+                
+                # ========== 步骤6: 定期刷新终端显示 ==========
+                current_time = time.time()
+                if current_time - self._last_stat_time >= self._display_interval:
+                    # 计算实际发布率
+                    actual_rate = self._publish_count / (current_time - self._last_stat_time)
+                    
+                    # 刷新终端显示
+                    self._print_status_display(
+                        euler1, euler2, euler3,
+                        (raw_x, raw_y, raw_z),
+                        mapped[:3],
+                        gripper_value,
+                        actual_rate
+                    )
+                    
+                    # 重置统计
+                    self._publish_count = 0
+                    self._last_stat_time = current_time
+                
+                # ========== 步骤7: 精确定时控制 ==========
+                elapsed = time.time() - loop_start
+                to_sleep = max(0.0, self._publish_interval - elapsed)
+                time.sleep(to_sleep)
+                
+            except Exception as e:
+                print(f"[Error] 发布循环异常: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(0.1)
+    
+    def _debug_publisher_loop(self):
+        """
+        调试数据发布循环 (与triple debug_publisher_thread完全一致的数据格式)
+        
+        发送给 pyqt5_viewer 使用，格式必须匹配UI期望的结构
+        """
+        debug_interval = 1.0 / config.control.publish_rate
+        publish_count = 0
+        last_debug_print = 0
+        
+        while self._running:
+            try:
+                current_time = time.time()
+                
+                # 获取IMU欧拉角数据 (与triple格式一致)
+                euler1 = self.imu.get_euler_dict(0x50)
+                euler2 = self.imu.get_euler_dict(0x51)
+                euler3 = self.imu.get_euler_dict(0x52)
+                
+                # 每2秒打印一次调试信息
+                if current_time - last_debug_print > 2.0:
+                    print(f"[DEBUG SEND] euler1={euler1}, euler2={euler2}")
+                    last_debug_print = current_time
+                
+                # 获取IMU在线状态
+                imu1_online = self.imu.is_online(0x50)
+                imu2_online = self.imu.is_online(0x51)
+                imu3_online = self.imu.is_online(0x52)
+                
+                # 获取视频帧 (如果有)
+                video_left = self.video.get_latest_frame('left') if hasattr(self.video, 'get_latest_frame') else None
+                video_top = self.video.get_latest_frame('top') if hasattr(self.video, 'get_latest_frame') else None
+                
+                # 获取音频数据 (如果有)
+                audio_waveform = getattr(self.audio, 'latest_waveform', None)
+                audio_rms = getattr(self.audio, 'latest_rms', 0.0)
+                audio_frame_count = getattr(self.audio, 'frame_count', 0)
+                audio_underrun_count = getattr(self.audio, 'underrun_count', 0)
+                
+                # 计算发布频率
+                uptime = current_time - self._start_time
+                publish_rate = self._publish_count / uptime if uptime > 0 else 0.0
+                
+                # === 构建调试数据 (与triple debug_data 完全一致) ===
+                debug_data = {
+                    "timestamp": current_time,
+                    "imu1": {
+                        "roll": float(euler1["roll"]),
+                        "pitch": float(euler1["pitch"]),
+                        "yaw": float(euler1["yaw"])
+                    },
+                    "imu2": {
+                        "roll": float(euler2["roll"]),
+                        "pitch": float(euler2["pitch"]),
+                        "yaw": float(euler2["yaw"])
+                    },
+                    "imu3": {
+                        "roll": float(euler3["roll"]),
+                        "pitch": float(euler3["pitch"]),
+                        "yaw": float(euler3["yaw"])
+                    },
+                    "position": {
+                        "raw": list(self._current_raw_coords) if self._current_raw_coords else [0.0, 0.0, 0.0],
+                        "mapped": list(self._current_clipped_coords) if self._current_clipped_coords else [0.0, 0.0, 0.0]
+                    },
+                    "gripper": float(self.gripper.value),
+                    "online_status": {
+                        "imu1": imu1_online,
+                        "imu2": imu2_online,
+                        "imu3": imu3_online
+                    },
+                    "stats": {
+                        "publish_count": publish_count,
+                        "publish_rate": publish_rate,
+                        "video_frame_count": self.video.frame_count if hasattr(self.video, 'frame_count') else 0,
+                        "video_latency": getattr(self.video, 'latency', 0.0)
+                    },
+                    "config": {
+                        "L1": config.arm.L1,
+                        "L2": config.arm.L2,
+                        "yaw_mode": config.imu.yaw_normalization_mode
+                    },
+                    "video_left": video_left,  # JPEG bytes or None
+                    "video_top": video_top,    # JPEG bytes or None
+                    "audio": {
+                        "waveform": audio_waveform.tolist() if audio_waveform is not None else [],
+                        "rms": float(audio_rms),
+                        "frame_count": audio_frame_count,
+                        "underrun_count": audio_underrun_count,
+                        "receiving": self.audio.is_receiving if hasattr(self.audio, 'is_receiving') else False
+                    }
+                }
+                
+                # 发布 (使用pickle格式，与triple一致)
+                self.zmq.publish_debug_data(debug_data)
+                publish_count += 1
+                
+                time.sleep(debug_interval)
+                
+            except Exception as e:
+                print(f"[Error] 调试发布循环异常: {e}")
+                time.sleep(0.1)
+    
+    def _init_opencv_windows(self):
+        """初始化OpenCV视频显示窗口（像triple一样）"""
+        if not CV2_AVAILABLE or not config.network.video.display_opencv:
+            return False
+        
+        try:
+            cv2.namedWindow('Left Wrist Camera', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('Left Wrist Camera', 640, 480)
+            cv2.namedWindow('Top Camera', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('Top Camera', 640, 480)
+            print("✓ OpenCV双摄像头窗口已创建（Left Wrist + Top）")
+            return True
+        except Exception as e:
+            print(f"⚠️  OpenCV窗口创建失败（可能无显示环境）: {e}")
+            return False
+    
+    def _video_receiver_loop(self):
+        """
+        视频接收循环
+        
+        功能:
+        - 从ZMQ接收视频帧
+        - 传递给VideoReceiver处理
+        - 如果启用display_opencv，则使用cv2.imshow显示（像triple一样）
+        """
+        # 初始化OpenCV窗口
+        opencv_display = self._init_opencv_windows()
+        video_frame_count = 0
+        
+        while self._running:
+            try:
+                frame_data = self.zmq.receive_video_frame()
+                if frame_data:
+                    # 处理视频数据（解码并存储）
+                    self.video.process_data(frame_data)
+                    video_frame_count += 1
+                    
+                    # OpenCV显示（像triple一样）
+                    if opencv_display and CV2_AVAILABLE:
+                        frame1, frame2 = self.video.get_frames()
+                        
+                        if frame1 is not None:
+                            # 叠加信息
+                            cv2.putText(frame1, f"Left Wrist - Frame: {video_frame_count}", 
+                                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                                       0.6, (0, 255, 255), 2)
+                            cv2.imshow('Left Wrist Camera', frame1)
+                        
+                        if frame2 is not None:
+                            # 叠加信息
+                            cv2.putText(frame2, f"Top - Frame: {video_frame_count}", 
+                                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                                       0.6, (0, 255, 255), 2)
+                            cv2.imshow('Top Camera', frame2)
+                        
+                        # 处理按键（按 'q' 退出）
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord('q'):
+                            print("\n⚠️  视频窗口按下'q'，退出...")
+                            self._running = False
+                            break
+                else:
+                    time.sleep(0.001)
+            except Exception as e:
+                print(f"[Error] 视频接收异常: {e}")
+                time.sleep(0.1)
+        
+        # 清理OpenCV窗口
+        if opencv_display and CV2_AVAILABLE:
+            cv2.destroyAllWindows()
+    
+    def _audio_receiver_loop(self):
+        """音频接收循环"""
+        while self._running:
+            try:
+                audio_data = self.zmq.receive_audio_data()
+                if audio_data:
+                    self.audio.process_data(audio_data)
+                else:
+                    time.sleep(0.001)
+            except Exception as e:
+                print(f"[Error] 音频接收异常: {e}")
+                time.sleep(0.1)
+    
+    def _ui_command_loop(self):
+        """UI 命令接收循环"""
+        print("[UI Command] 命令接收器已启动")
+        while self._running:
+            try:
+                cmd = self.zmq.receive_ui_command()
+                if cmd:
+                    self._handle_ui_command(cmd)
+                else:
+                    time.sleep(0.01)
+            except Exception as e:
+                print(f"[Error] UI命令接收异常: {e}")
+                time.sleep(0.1)
+    
+    def _handle_ui_command(self, cmd: dict):
+        """处理来自UI的命令"""
+        cmd_type = cmd.get("type", "")
+        
+        if cmd_type == "gripper":
+            action = cmd.get("action", "")
+            
+            if action == "open":
+                # 增大夹爪值
+                new_value = min(1.0, self.gripper.value + 0.05)
+                self.gripper.set_value(new_value)
+                print(f"[UI Command] 夹爪打开: {new_value:.2f}")
+                
+            elif action == "close":
+                # 减小夹爪值
+                new_value = max(0.0, self.gripper.value - 0.05)
+                self.gripper.set_value(new_value)
+                print(f"[UI Command] 夹爪关闭: {new_value:.2f}")
+                
+            elif action == "stop":
+                # 停止（不做任何操作）
+                pass
+                
+            elif action == "set":
+                # 直接设置值
+                value = cmd.get("value", 0.5)
+                self.gripper.set_value(value)
+                print(f"[UI Command] 夹爪设置: {value:.2f}")
+        
+        else:
+            print(f"[UI Command] 未知命令类型: {cmd_type}")
+
+
+def main():
+    """主入口"""
+    parser = argparse.ArgumentParser(
+        description='IMU机械臂控制系统',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例:
+    python main.py                        # 使用默认配置
+    python main.py --config custom.yaml   # 使用自定义配置文件
+    
+配置文件:
+    所有参数都在 config/settings.yaml 中配置
+    无需复杂命令行参数
+        """
+    )
+    parser.add_argument(
+        '--config', '-c',
+        type=str,
+        default=None,
+        help='配置文件路径 (默认: config/settings.yaml)'
+    )
+    
+    args = parser.parse_args()
+    
+    # 加载自定义配置
+    if args.config:
+        config.load(args.config)
+    
+    # 创建控制器
+    controller = IMUArmController()
+    
+    # 信号处理
+    def signal_handler(sig, frame):
+        controller.stop()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # 初始化
+    if not controller.setup():
+        print("[Error] 初始化失败")
+        sys.exit(1)
+    
+    # 启动
+    controller.start()
+    
+    # 保持运行
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        controller.stop()
+
+
+if __name__ == '__main__':
+    main()

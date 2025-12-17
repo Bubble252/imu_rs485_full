@@ -1,0 +1,142 @@
+# ============================================================================
+#                       IMU机械臂控制系统 - 配置文件
+# ============================================================================
+# 所有参数统一在此配置，无需在命令行输入复杂参数
+# 修改后重启程序生效
+# ============================================================================
+
+# === 系统基础配置 ===
+system:
+  name: "IMU Arm Control System"
+  version: "2.0.0"
+  debug: false                    # 是否启用调试模式（打印更多日志）
+
+# === 机械臂物理参数 ===
+arm:
+  link1_length: 0.25              # 杆1长度（米）
+  link2_length: 0.27              # 杆2长度（米）
+
+# === IMU设备配置 ===
+imu:
+  serial_port: "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+  baudrate: 115200
+  
+  # IMU地址
+  addresses:
+    imu1: 0x50                    # 80 - 杆1
+    imu2: 0x51                    # 81 - 杆2  
+    imu3: 0x52                    # 82 - 机械爪
+  
+  # Yaw归零模式: "NORMAL" / "AUTO" / "SIMPLE" / "OFF"
+  yaw_normalization_mode: "NORMAL"
+  yaw_normalization_threshold: 100.0
+
+# === ZeroMQ网络配置 ===
+network:
+  # 发送控制数据到B端服务器
+  b_server:
+    enabled: true
+    host: "localhost"
+    port: 5555
+  
+  # 本地LeRobot仿真（可选）
+  lerobot:
+    enabled: false
+    host: "localhost"
+    port: 5559
+  
+  # 视频接收（从B端）
+  video:
+    enabled: true
+    host: "localhost"
+    port: 5557
+    display_opencv: true          # 是否显示OpenCV窗口（像triple一样显示视频）
+  
+  # 音频接收（从B端）
+  audio:
+    enabled: true
+    host: "localhost"
+    port: 5561
+    sample_rate: 48000
+    channels: 1
+    buffer_size: 5                # 音频缓冲帧数
+  
+  # 调试数据发布（给PyQt5 UI）
+  debug_ui:
+    enabled: true
+    port: 5560
+  
+  # UI命令接收端口
+  ui_command:
+    port: 5562
+
+# === 控制参数 ===
+control:
+  publish_rate: 20                # 发布频率（Hz）
+  online_only: true               # 仅在所有IMU在线时发布
+  
+  # 夹爪控制
+  gripper:
+    step: 0.005                   # 每次调整步长
+    update_rate: 50               # 更新频率（Hz）
+    key_timeout: 0.1              # 按键超时（秒）
+
+# === 坐标映射参数 ===
+coordinate_mapping:
+  # 原始工作空间范围（米）
+  raw:
+    x_min: 0.39
+    x_max: 0.52
+    y_min: -0.4
+    y_max: 0.4
+    z_min: 0.0
+    z_max: 0.3
+  
+  # 目标空间范围（米）
+  target:
+    x_min: 0.22
+    x_max: 0.42
+    y_min: -0.2
+    y_max: 0.2
+    z_min: 0.1
+    z_max: 0.4
+
+# === SSH隧道配置（用于远程连接B端服务器）===
+ssh_tunnel:
+  enabled: false                  # 是否使用SSH隧道
+  
+  # 跳板机配置
+  proxy:
+    host: "202.112.113.78"
+    port: 2258
+    user: "root"
+    key_file: "keys/leo_tmp_2258.txt"
+  
+  # 目标服务器配置
+  target:
+    host: "202.112.113.74"
+    port: 2237
+    user: "root"
+    key_file: "keys/capri_yhx_2237"
+  
+  # 端口转发列表
+  port_forwards:
+    - 5555
+    - 5556
+    - 5557
+    - 5558
+    - 5559
+    - 5561
+
+# === 轨迹记录 ===
+trajectory:
+  max_points: 1000                # 最大记录点数
+  save_on_exit: true              # 退出时是否保存轨迹图
+
+# === UI显示配置 ===
+ui:
+  window_title: "IMU 3D Visualization & Dual Camera Viewer"
+  window_size: [1800, 850]
+  trajectory_points: 500          # UI显示的轨迹点数
+  chart_points: 100               # 曲线图数据点数
+  print_interval: 3               # 终端数据打印间隔（秒）

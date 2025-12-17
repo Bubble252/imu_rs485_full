@@ -1,0 +1,13 @@
+# 主程序依赖 (lerobot环境)
+pyserial>=3.5
+pyzmq>=25.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+PyYAML>=6.0
+
+# 可选: 音频支持
+opuslib>=3.0.0
+pyaudio>=0.2.13
+
+# 可选: 视频支持
+opencv-python>=4.8.0
