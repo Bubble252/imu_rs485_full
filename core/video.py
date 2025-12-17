@@ -5,7 +5,7 @@
 负责:
 - 接收JPEG编码的视频流
 - 视频帧解码
-- 双摄像头视频管理
+- 多摄像头视频管理（支持动态数量）
 - 帧率统计
 """
 
@@ -13,7 +13,7 @@ import threading
 import time
 import struct
 import pickle
-from typing import Optional, Callable, Dict, Tuple
+from typing import Optional, Callable, Dict, Tuple, List
 from collections import deque
 import numpy as np
 
@@ -29,35 +29,39 @@ from config import config
 
 class VideoReceiver:
     """
-    视频接收和处理类
+    视频接收和处理类（多摄像头版本）
     
     功能:
-    - 从ZMQ接收双摄像头JPEG编码的视频数据
+    - 从ZMQ接收多摄像头JPEG编码的视频数据
     - 解码为OpenCV图像格式
+    - 动态支持任意数量摄像头
     - 提供帧数据给UI显示
     
-    支持两种视频数据格式:
+    支持的视频数据格式:
     
-    1. Pickle Dict格式 (B端发送的格式):
+    Pickle Dict格式 (B端发送的格式):
        pickle.dumps({
-           'image.left_wrist': JPEG bytes,  # 摄像头1
-           'image.top': JPEG bytes,          # 摄像头2
+           'image.left_wrist': JPEG bytes,  # 摄像头1 - 手腕
+           'image.left': JPEG bytes,         # 摄像头2 - 左侧
+           'image.right': JPEG bytes,        # 摄像头3 - 右侧
            'encoding': 'jpeg',
            'timestamp': float
        })
-    
-    2. Length-prefixed二进制格式 (旧格式):
-       - 4字节: 摄像头1帧大小 (uint32 little-endian)
-       - N字节: 摄像头1 JPEG数据
-       - 4字节: 摄像头2帧大小 (uint32 little-endian)  
-       - M字节: 摄像头2 JPEG数据
     
     Usage:
         receiver = VideoReceiver()
         receiver.start()
         
-        # 获取最新帧
-        frame1, frame2 = receiver.get_frames()
+        # 获取所有帧
+        frames = receiver.get_all_frames()
+        # 返回: {'left_wrist': np.ndarray, 'left': np.ndarray, 'right': np.ndarray}
+        
+        # 获取特定相机帧
+        frame = receiver.get_frame('left_wrist')
+        
+        # 获取相机列表
+        cameras = receiver.get_camera_names()
+        # 返回: ['left_wrist', 'left', 'right']
         
         receiver.stop()
     """
@@ -66,10 +70,12 @@ class VideoReceiver:
         """初始化视频接收器"""
         self._running = False
         
-        # 帧存储
-        self._frame1: Optional[np.ndarray] = None
-        self._frame2: Optional[np.ndarray] = None
+        # 多相机帧存储 (camera_name -> frame)
+        self._frames: Dict[str, np.ndarray] = {}
         self._frame_lock = threading.Lock()
+        
+        # 已知的相机名称列表（按接收顺序）
+        self._camera_names: List[str] = []
         
         # 帧率统计
         self._fps_window = deque(maxlen=30)  # 最近30帧的时间戳
@@ -78,105 +84,73 @@ class VideoReceiver:
         # 最后接收时间
         self._last_frame_time = 0.0
         
-        # 数据回调
-        self._frame_callback: Optional[Callable[[np.ndarray, np.ndarray], None]] = None
+        # 数据回调 (参数为 Dict[str, np.ndarray])
+        self._frame_callback: Optional[Callable[[Dict[str, np.ndarray]], None]] = None
     
     def process_data(self, data: bytes):
         """
-        处理接收到的视频数据
+        处理接收到的视频数据（支持多摄像头）
         
-        支持两种格式:
-        1. Pickle dict格式 (来自B端): {'image.left_wrist': JPEG bytes, 'image.top': JPEG bytes, ...}
-        2. Length-prefixed二进制格式 (旧格式): 4字节size + JPEG + 4字节size + JPEG
+        自动检测所有 'image.*' 格式的相机数据并解码
         
         Args:
-            data: 包含双摄像头JPEG数据的字节流
+            data: pickle序列化的字典，包含多个相机的JPEG数据
+                  格式: {'image.left_wrist': bytes, 'image.left': bytes, 'image.right': bytes, ...}
         """
         if not CV2_AVAILABLE:
             return
         
         try:
-            frame1 = None
-            frame2 = None
-            
-            # 首先尝试pickle格式 (B端发送的格式)
+            # 解析pickle数据
             try:
                 video_frame = pickle.loads(data)
-                if isinstance(video_frame, dict):
-                    # 从dict中提取JPEG数据
-                    # B端格式: {'image.left_wrist': bytes, 'image.top': bytes, 'encoding': 'jpeg', 'timestamp': ...}
-                    frame1_data = video_frame.get('image.left_wrist') or video_frame.get('frame1')
-                    frame2_data = video_frame.get('image.top') or video_frame.get('frame2')
-                    
-                    if frame1_data:
-                        frame1 = self._decode_jpeg(frame1_data)
-                    if frame2_data:
-                        frame2 = self._decode_jpeg(frame2_data)
-                    
-                    # 如果至少解码了一个帧，则认为成功
-                    if frame1 is not None or frame2 is not None:
-                        self._update_frames(frame1, frame2)
-                        return
-            except (pickle.UnpicklingError, TypeError, KeyError):
-                # 不是pickle格式，尝试下一种格式
-                pass
-            
-            # 回退到length-prefixed二进制格式 (旧格式)
-            if len(data) < 8:
+                if not isinstance(video_frame, dict):
+                    return
+            except (pickle.UnpicklingError, TypeError):
                 return
             
-            # 读取摄像头1帧大小
-            frame1_size = struct.unpack('<I', data[0:4])[0]
+            # 动态检测所有相机 (image.* 格式)
+            decoded_frames: Dict[str, np.ndarray] = {}
             
-            if len(data) < 8 + frame1_size:
-                return
+            for key, value in video_frame.items():
+                if key.startswith('image.') and isinstance(value, bytes):
+                    camera_name = key.replace('image.', '')
+                    frame = self._decode_jpeg(value)
+                    if frame is not None:
+                        decoded_frames[camera_name] = frame
+                        
+                        # 记录新发现的相机
+                        if camera_name not in self._camera_names:
+                            self._camera_names.append(camera_name)
+                            print(f"[Video] 🎥 发现新相机: {camera_name}")
             
-            # 读取摄像头1数据
-            frame1_data = data[4:4 + frame1_size]
-            
-            # 读取摄像头2帧大小
-            frame2_offset = 4 + frame1_size
-            frame2_size = struct.unpack('<I', data[frame2_offset:frame2_offset + 4])[0]
-            
-            if len(data) < frame2_offset + 4 + frame2_size:
-                return
-            
-            # 读取摄像头2数据
-            frame2_data = data[frame2_offset + 4:frame2_offset + 4 + frame2_size]
-            
-            # 解码JPEG
-            frame1 = self._decode_jpeg(frame1_data)
-            frame2 = self._decode_jpeg(frame2_data)
-            
-            self._update_frames(frame1, frame2)
+            # 更新帧
+            if decoded_frames:
+                self._update_frames(decoded_frames)
                     
         except Exception as e:
             print(f"[Video] 处理视频数据失败: {e}")
     
-    def _update_frames(self, frame1: Optional[np.ndarray], frame2: Optional[np.ndarray]):
+    def _update_frames(self, frames: Dict[str, np.ndarray]):
         """
         更新帧数据并触发回调
         
         Args:
-            frame1: 摄像头1帧
-            frame2: 摄像头2帧
+            frames: 相机名称到帧的映射
         """
-        if frame1 is not None or frame2 is not None:
-            with self._frame_lock:
-                if frame1 is not None:
-                    self._frame1 = frame1
-                if frame2 is not None:
-                    self._frame2 = frame2
-            
-            # 更新统计
-            current_time = time.time()
-            self._fps_window.append(current_time)
-            self._frames_received += 1
-            self._last_frame_time = current_time
-            
-            # 触发回调
-            if self._frame_callback and self._frame1 is not None and self._frame2 is not None:
-                self._frame_callback(self._frame1, self._frame2)
+        with self._frame_lock:
+            for camera_name, frame in frames.items():
+                self._frames[camera_name] = frame
+        
+        # 更新统计
+        current_time = time.time()
+        self._fps_window.append(current_time)
+        self._frames_received += 1
+        self._last_frame_time = current_time
+        
+        # 触发回调
+        if self._frame_callback:
+            self._frame_callback(self._frames.copy())
     
     def _decode_jpeg(self, data: bytes) -> Optional[np.ndarray]:
         """
@@ -196,37 +170,71 @@ class VideoReceiver:
             print(f"[Video] JPEG解码失败: {e}")
             return None
     
-    def set_frame_callback(self, callback: Callable[[np.ndarray, np.ndarray], None]):
+    def set_frame_callback(self, callback: Callable[[Dict[str, np.ndarray]], None]):
         """
         设置帧回调函数
         
         Args:
-            callback: 当有新帧时的回调函数，参数为(frame1, frame2)
+            callback: 当有新帧时的回调函数，参数为 Dict[camera_name, frame]
         """
         self._frame_callback = callback
     
-    def get_frames(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def get_all_frames(self) -> Dict[str, np.ndarray]:
         """
-        获取最新帧
+        获取所有相机的最新帧
         
         Returns:
-            Tuple[frame1, frame2]: 两个摄像头的最新帧
+            Dict[str, np.ndarray]: 相机名称到帧的映射
         """
         with self._frame_lock:
+            return {name: frame.copy() for name, frame in self._frames.items()}
+    
+    def get_frame(self, camera_name: str) -> Optional[np.ndarray]:
+        """
+        获取指定相机的最新帧
+        
+        Args:
+            camera_name: 相机名称（如 'left_wrist', 'left', 'right'）
+            
+        Returns:
+            Optional[np.ndarray]: 帧数据，不存在返回None
+        """
+        with self._frame_lock:
+            frame = self._frames.get(camera_name)
+            return frame.copy() if frame is not None else None
+    
+    def get_camera_names(self) -> List[str]:
+        """
+        获取所有已发现的相机名称列表
+        
+        Returns:
+            List[str]: 相机名称列表（按发现顺序）
+        """
+        return self._camera_names.copy()
+    
+    def get_camera_count(self) -> int:
+        """获取相机数量"""
+        return len(self._camera_names)
+    
+    # === 兼容旧API（保留以防UI依赖） ===
+    def get_frames(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        获取前两个相机的帧（兼容旧API）
+        
+        Returns:
+            Tuple[frame1, frame2]: 前两个摄像头的最新帧
+        """
+        with self._frame_lock:
+            frame1 = None
+            frame2 = None
+            if len(self._camera_names) > 0:
+                frame1 = self._frames.get(self._camera_names[0])
+            if len(self._camera_names) > 1:
+                frame2 = self._frames.get(self._camera_names[1])
             return (
-                self._frame1.copy() if self._frame1 is not None else None,
-                self._frame2.copy() if self._frame2 is not None else None
+                frame1.copy() if frame1 is not None else None,
+                frame2.copy() if frame2 is not None else None
             )
-    
-    def get_frame1(self) -> Optional[np.ndarray]:
-        """获取摄像头1最新帧"""
-        with self._frame_lock:
-            return self._frame1.copy() if self._frame1 is not None else None
-    
-    def get_frame2(self) -> Optional[np.ndarray]:
-        """获取摄像头2最新帧"""
-        with self._frame_lock:
-            return self._frame2.copy() if self._frame2 is not None else None
     
     def get_fps(self) -> float:
         """
@@ -264,7 +272,7 @@ class VideoReceiver:
     def stop(self):
         """停止视频接收器"""
         self._running = False
-        print(f"[Video] 已停止，共接收 {self._frames_received} 帧")
+        print(f"[Video] 已停止，共接收 {self._frames_received} 帧，相机: {self._camera_names}")
     
     def get_stats(self) -> dict:
         """获取统计信息"""
@@ -272,6 +280,7 @@ class VideoReceiver:
             'frames_received': self._frames_received,
             'fps': self.get_fps(),
             'is_receiving': self.is_receiving(),
-            'has_frame1': self._frame1 is not None,
-            'has_frame2': self._frame2 is not None,
+            'camera_count': len(self._camera_names),
+            'camera_names': self._camera_names.copy(),
+            'has_frames': {name: True for name in self._frames.keys()},
         }

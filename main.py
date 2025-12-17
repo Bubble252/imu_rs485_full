@@ -98,6 +98,10 @@ class IMUArmController:
         self._display_interval = 0.3  # 终端刷新间隔（秒）
         self._skip_count = 0
         
+        # 多相机窗口管理
+        self._camera_window_names: Dict[str, str] = {}  # camera_name -> window_title
+        self._created_windows: Dict[str, bool] = {}     # camera_name -> is_created
+        
     def setup(self) -> bool:
         """
         初始化所有连接
@@ -689,33 +693,70 @@ class IMUArmController:
                 print(f"[Error] 调试发布循环异常: {e}")
                 time.sleep(0.1)
     
-    def _init_opencv_windows(self):
-        """初始化OpenCV视频显示窗口（像triple一样）"""
+    def _init_opencv_windows(self) -> Dict[str, bool]:
+        """
+        初始化OpenCV视频显示窗口（动态多相机支持）
+        
+        Returns:
+            Dict[str, bool]: 相机名称到窗口是否创建成功的映射
+        """
         if not CV2_AVAILABLE or not config.network.video.display_opencv:
+            return {}
+        
+        # 预定义的相机窗口配置 (相机名称 -> 窗口标题)
+        self._camera_window_names = {
+            'left_wrist': 'Left Wrist Camera',
+            'left': 'Left Side Camera', 
+            'right': 'Right Side Camera',
+            'top': 'Top Camera',  # 保留兼容
+        }
+        self._created_windows: Dict[str, bool] = {}
+        return self._created_windows
+    
+    def _ensure_camera_window(self, camera_name: str) -> bool:
+        """
+        确保指定相机的窗口已创建
+        
+        Args:
+            camera_name: 相机名称
+            
+        Returns:
+            bool: 窗口是否可用
+        """
+        if not CV2_AVAILABLE:
             return False
+            
+        if camera_name in self._created_windows:
+            return self._created_windows[camera_name]
+        
+        # 获取窗口标题
+        window_title = self._camera_window_names.get(camera_name, f'Camera: {camera_name}')
         
         try:
-            cv2.namedWindow('Left Wrist Camera', cv2.WINDOW_NORMAL)
-            cv2.resizeWindow('Left Wrist Camera', 640, 480)
-            cv2.namedWindow('Top Camera', cv2.WINDOW_NORMAL)
-            cv2.resizeWindow('Top Camera', 640, 480)
-            print("✓ OpenCV双摄像头窗口已创建（Left Wrist + Top）")
+            cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_title, 640, 480)
+            self._created_windows[camera_name] = True
+            print(f"✓ 创建相机窗口: {window_title}")
             return True
         except Exception as e:
-            print(f"⚠️  OpenCV窗口创建失败（可能无显示环境）: {e}")
+            print(f"⚠️  创建窗口 {window_title} 失败: {e}")
+            self._created_windows[camera_name] = False
             return False
     
     def _video_receiver_loop(self):
         """
-        视频接收循环
+        视频接收循环（支持动态多相机）
         
         功能:
         - 从ZMQ接收视频帧
         - 传递给VideoReceiver处理
-        - 如果启用display_opencv，则使用cv2.imshow显示（像triple一样）
+        - 动态创建每个相机的显示窗口
         """
-        # 初始化OpenCV窗口
-        opencv_display = self._init_opencv_windows()
+        # 初始化OpenCV窗口管理
+        opencv_enabled = config.network.video.display_opencv and CV2_AVAILABLE
+        if opencv_enabled:
+            self._init_opencv_windows()
+        
         video_frame_count = 0
         
         while self._running:
@@ -726,23 +767,28 @@ class IMUArmController:
                     self.video.process_data(frame_data)
                     video_frame_count += 1
                     
-                    # OpenCV显示（像triple一样）
-                    if opencv_display and CV2_AVAILABLE:
-                        frame1, frame2 = self.video.get_frames()
+                    # OpenCV显示（动态多相机）
+                    if opencv_enabled:
+                        frames = self.video.get_all_frames()
                         
-                        if frame1 is not None:
-                            # 叠加信息
-                            cv2.putText(frame1, f"Left Wrist - Frame: {video_frame_count}", 
-                                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                                       0.6, (0, 255, 255), 2)
-                            cv2.imshow('Left Wrist Camera', frame1)
-                        
-                        if frame2 is not None:
-                            # 叠加信息
-                            cv2.putText(frame2, f"Top - Frame: {video_frame_count}", 
-                                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                                       0.6, (0, 255, 255), 2)
-                            cv2.imshow('Top Camera', frame2)
+                        for camera_name, frame in frames.items():
+                            if frame is not None:
+                                # 确保窗口已创建
+                                if self._ensure_camera_window(camera_name):
+                                    # 获取窗口标题
+                                    window_title = self._camera_window_names.get(
+                                        camera_name, f'Camera: {camera_name}'
+                                    )
+                                    
+                                    # 叠加信息
+                                    display_frame = frame.copy()
+                                    cv2.putText(
+                                        display_frame, 
+                                        f"{camera_name} - Frame: {video_frame_count}", 
+                                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                                        0.6, (0, 255, 255), 2
+                                    )
+                                    cv2.imshow(window_title, display_frame)
                         
                         # 处理按键（按 'q' 退出）
                         key = cv2.waitKey(1) & 0xFF
@@ -757,7 +803,7 @@ class IMUArmController:
                 time.sleep(0.1)
         
         # 清理OpenCV窗口
-        if opencv_display and CV2_AVAILABLE:
+        if opencv_enabled:
             cv2.destroyAllWindows()
     
     def _audio_receiver_loop(self):
