@@ -24,6 +24,7 @@ import signal
 import time
 import threading
 import argparse
+import select
 import numpy as np
 from typing import Optional, Dict, Any
 
@@ -101,6 +102,12 @@ class IMUArmController:
         # 多相机窗口管理
         self._camera_window_names: Dict[str, str] = {}  # camera_name -> window_title
         self._created_windows: Dict[str, bool] = {}     # camera_name -> is_created
+        
+        # 录制控制状态
+        self._recording_state = "idle"  # idle, recording, pending
+        self._episode_frame_count = 0
+        self._last_recording_command = None
+        self._recording_start_time = 0.0
         
     def setup(self) -> bool:
         """
@@ -231,6 +238,7 @@ class IMUArmController:
             self._debug_publisher_thread,
             self._video_thread,
             self._audio_thread,
+            getattr(self, '_keyboard_thread', None),
         ]
         for t in threads:
             if t and t.is_alive():
@@ -283,6 +291,10 @@ class IMUArmController:
         print("⌨️  键盘控制已启用:")
         print("    按住 '1' - 夹爪持续打开")
         print("    按住 '2' - 夹爪持续闭合")
+        print("    按 'S' - 开始录制 episode")
+        print("    按 'E' - 结束录制 episode")
+        print("    按 'Y' - 保存当前 episode")
+        print("    按 'N' - 丢弃当前 episode")
         print("    按 'q' 或 Ctrl+C - 退出程序")
         print("=" * W)
         print()
@@ -411,12 +423,23 @@ class IMUArmController:
         else:
             print(f"│ 🖥️  调试UI: 未启用".ljust(W+2) + "│")
         
+        # 录制状态
+        print("├" + "─" * W + "┤")
+        if self._recording_state == "recording":
+            elapsed = time.time() - self._recording_start_time
+            status_text = f"🔴 录制中 - 帧数: {self._episode_frame_count}, 时长: {elapsed:.1f}s"
+        elif self._recording_state == "pending":
+            status_text = f"⏸️  等待保存/丢弃 - 帧数: {self._episode_frame_count} (按Y/N)"
+        else:
+            status_text = "⚪ 未录制 (按S开始)"
+        print(f"│ 📼 {status_text}".ljust(W+3) + "│")
+        
         print("└" + "─" * W + "┘")
         
         # 控制提示
         print()
         print("─" * W)
-        print("⌨️  控制: 按住'1'打开夹爪 │ 按住'2'闭合夹爪 │ Ctrl+C 退出")
+        print("⌨️  控制: '1'/'2' 夹爪 │ S:开始 E:结束 Y:保存 N:丢弃 │ q:退出")
         print("─" * W)
     
     # ==================== 回调和循环 ====================
@@ -538,6 +561,15 @@ class IMUArmController:
                         "imu3_online": imu3_online,
                     }
                 }
+                
+                # 添加录制控制命令（可选字段）
+                if self._last_recording_command:
+                    control_data["recording"] = self._last_recording_command
+                    self._last_recording_command = None  # 发送后清除
+                
+                # 如果正在录制，增加帧计数
+                if self._recording_state == "recording":
+                    self._episode_frame_count += 1
                 
                 # 发送到B服务器
                 self.zmq.send_control_data(control_data)
@@ -858,16 +890,171 @@ class IMUArmController:
                 
             elif action == "set":
                 # 直接设置值
-                value = cmd.get("value", 0.5)
+                value = cmd.get("value", self.gripper.value)
                 self.gripper.set_value(value)
-                print(f"[UI Command] 夹爪设置: {value:.2f}")
         
         else:
             print(f"[UI Command] 未知命令类型: {cmd_type}")
+    
+    # ==================== 录制控制方法 ====================
+    
+    def _start_recording(self):
+        """开始录制"""
+        if self._recording_state == "idle":
+            self._recording_state = "recording"
+            self._episode_frame_count = 0
+            self._recording_start_time = time.time()
+            self._last_recording_command = "start"
+            print(f"\n{'='*70}")
+            print("🔴 开始录制 Episode")
+            print(f"{'='*70}\n")
+    
+    def _end_recording(self):
+        """结束录制（进入待决定状态）"""
+        if self._recording_state == "recording":
+            self._recording_state = "pending"
+            self._last_recording_command = "end"
+            elapsed = time.time() - self._recording_start_time
+            print(f"\n{'='*70}")
+            print(f"⏸️  录制暂停 - 帧数: {self._episode_frame_count}, 时长: {elapsed:.1f}s")
+            print("按 'Y' 保存 或 'N' 丢弃")
+            print(f"{'='*70}\n")
+    
+    def _save_episode(self):
+        """保存当前 episode"""
+        if self._recording_state == "pending":
+            self._last_recording_command = "save"
+            print(f"\n{'='*70}")
+            print(f"💾 保存 Episode - 帧数: {self._episode_frame_count}")
+            print(f"{'='*70}\n")
+            # 重置状态
+            self._recording_state = "idle"
+            self._episode_frame_count = 0
+    
+    def _discard_episode(self):
+        """丢弃当前 episode"""
+        if self._recording_state == "pending":
+            self._last_recording_command = "discard"
+            print(f"\n{'='*70}")
+            print(f"🗑️  丢弃 Episode - 帧数: {self._episode_frame_count}")
+            print(f"{'='*70}\n")
+            # 重置状态
+            self._recording_state = "idle"
+            self._episode_frame_count = 0
+    
+    def _keyboard_listener_loop(self):
+        """键盘监听循环（用于录制控制）"""
+        try:
+            import sys
+            import tty
+            import termios
+        except ImportError:
+            print("⚠️ 警告: 无法导入termios，键盘控制功能禁用")
+            return
+        
+        print("[键盘监听] 录制控制已启动")
+        
+        # 保存原始终端设置
+        old_settings = termios.tcgetattr(sys.stdin)
+        
+        try:
+            tty.setcbreak(sys.stdin.fileno())
+            
+            while self._running:
+                if sys.stdin in select.select([sys.stdin], [], [], 0.1)[0]:
+                    char = sys.stdin.read(1).lower()
+                    
+                    if char == 's':
+                        self._start_recording()
+                    elif char == 'e':
+                        self._end_recording()
+                    elif char == 'y':
+                        self._save_episode()
+                    elif char == 'n':
+                        self._discard_episode()
+                    elif char == 'q':
+                        self._running = False
+                        break
+                        
+        finally:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+    
+    def start(self):
+        """启动控制系统"""
+        if self._running:
+            return
+        
+        self._running = True
+        self._start_time = time.time()
+        
+        # 启动IMU读取
+        self.imu.set_callback(self._on_imu_data)
+        self.imu.start()
+        
+        # 启动夹爪控制
+        self.gripper.start()
+        
+        # 启动ZMQ
+        self.zmq.start()
+        
+        # 启动发布线程
+        self._publisher_thread = threading.Thread(
+            target=self._publisher_loop,
+            daemon=True,
+            name="Publisher"
+        )
+        self._publisher_thread.start()
+        
+        # 启动调试发布线程
+        if config.network.debug_ui_enabled:
+            self._debug_publisher_thread = threading.Thread(
+                target=self._debug_publisher_loop,
+                daemon=True,
+                name="DebugPublisher"
+            )
+            self._debug_publisher_thread.start()
+            
+            # 启动 UI 命令接收线程
+            self._ui_command_thread = threading.Thread(
+                target=self._ui_command_loop,
+                daemon=True,
+                name="UICommandReceiver"
+            )
+            self._ui_command_thread.start()
+        
+        # 启动视频接收线程
+        if config.network.video.enabled:
+            self._video_thread = threading.Thread(
+                target=self._video_receiver_loop,
+                daemon=True,
+                name="VideoReceiver"
+            )
+            self._video_thread.start()
+            self.video.start()
+        
+        # 启动音频接收线程
+        if config.network.audio.enabled:
+            self._audio_thread = threading.Thread(
+                target=self._audio_receiver_loop,
+                daemon=True,
+                name="AudioReceiver"
+            )
+            self._audio_thread.start()
+            self.audio.start()
+        
+        # 启动键盘监听线程（录制控制）
+        self._keyboard_thread = threading.Thread(
+            target=self._keyboard_listener_loop,
+            daemon=True,
+            name="KeyboardListener"
+        )
+        self._keyboard_thread.start()
+        
+        # 打印启动信息（借鉴 triple 风格）
+        self._print_startup_banner()
 
 
 def main():
-    """主入口"""
     parser = argparse.ArgumentParser(
         description='IMU机械臂控制系统',
         formatter_class=argparse.RawDescriptionHelpFormatter,
