@@ -165,8 +165,8 @@ class IMUArmController:
         self.imu.set_callback(self._on_imu_data)
         self.imu.start()
         
-        # 启动夹爪控制
-        self.gripper.start()
+        # 启动夹爪控制（禁用其自带键盘监听，由统一键盘线程处理）
+        self.gripper.start(enable_keyboard=False)
         
         # 启动ZMQ
         self.zmq.start()
@@ -943,7 +943,18 @@ class IMUArmController:
             self._episode_frame_count = 0
     
     def _keyboard_listener_loop(self):
-        """键盘监听循环（用于录制控制）"""
+        """
+        统一键盘监听循环（处理录制控制 + 夹爪控制）
+        
+        按键说明:
+        - S: 开始录制
+        - E: 结束录制
+        - Y: 保存 Episode
+        - N: 丢弃 Episode
+        - 1: 夹爪张开（持续按住）
+        - 2: 夹爪闭合（持续按住）
+        - Q: 退出程序
+        """
         try:
             import sys
             import tty
@@ -952,7 +963,9 @@ class IMUArmController:
             print("⚠️ 警告: 无法导入termios，键盘控制功能禁用")
             return
         
-        print("[键盘监听] 录制控制已启动")
+        print("[键盘监听] 统一键盘控制已启动")
+        print("  S=开始录制  E=结束录制  Y=保存  N=丢弃")
+        print("  1=夹爪张开  2=夹爪闭合  Q=退出")
         
         # 保存原始终端设置
         old_settings = termios.tcgetattr(sys.stdin)
@@ -961,9 +974,11 @@ class IMUArmController:
             tty.setcbreak(sys.stdin.fileno())
             
             while self._running:
-                if sys.stdin in select.select([sys.stdin], [], [], 0.1)[0]:
+                # 优化：减少轮询间隔从 0.1s 到 0.01s（10ms），提升响应速度 10 倍
+                if sys.stdin in select.select([sys.stdin], [], [], 0.01)[0]:
                     char = sys.stdin.read(1).lower()
                     
+                    # 录制控制按键
                     if char == 's':
                         self._start_recording()
                     elif char == 'e':
@@ -972,9 +987,27 @@ class IMUArmController:
                         self._save_episode()
                     elif char == 'n':
                         self._discard_episode()
+                    
+                    # 夹爪控制按键 - 直接设置夹爪的当前按键状态
+                    elif char in ['1', '2']:
+                        if hasattr(self, 'gripper') and self.gripper:
+                            with self.gripper._lock:
+                                self.gripper._current_key = char
+                                self.gripper._last_key_time = time.time()
+                    
+                    # 退出按键
                     elif char == 'q':
+                        print("\n[键盘] 检测到退出键，正在停止...")
                         self._running = False
                         break
+                else:
+                    # 没有按键输入时，清除夹爪按键状态（实现"松开停止"）
+                    if hasattr(self, 'gripper') and self.gripper:
+                        with self.gripper._lock:
+                            # 只在超时后清除，允许短暂的按键间隙
+                            if self.gripper._current_key and \
+                               (time.time() - self.gripper._last_key_time > 0.05):
+                                self.gripper._current_key = None
                         
         finally:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
@@ -991,8 +1024,8 @@ class IMUArmController:
         self.imu.set_callback(self._on_imu_data)
         self.imu.start()
         
-        # 启动夹爪控制
-        self.gripper.start()
+        # 启动夹爪控制（禁用其自带键盘监听，由统一键盘线程处理）
+        self.gripper.start(enable_keyboard=False)
         
         # 启动ZMQ
         self.zmq.start()
