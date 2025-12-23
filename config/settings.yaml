@@ -133,6 +133,19 @@ trajectory:
   max_points: 1000                # 最大记录点数
   save_on_exit: true              # 退出时是否保存轨迹图
 
+# === 数据集配置（LeRobot）===
+# repo_id 为空字符串或不设置时，默认使用启动时的时间戳 (YYYYMMDD_HHMMSS)
+# 也可通过命令行参数 --repo-id 覆盖
+dataset:
+  repo_id: ""                     # 数据集名称/ID (空=使用时间戳)
+  instruction: "Real robot teleoperation"  # 任务描述
+  fps: 30                         # 视频帧率
+  data_root: "real_robot_data"    # 数据保存根目录
+  action_dim: 13                  # 动作维度
+  state_dim: 13                   # 状态维度
+  image_height: 480               # 图像高度
+  image_width: 640                # 图像宽度
+
 # === UI显示配置 ===
 ui:
   window_title: "IMU 3D Visualization & Dual Camera Viewer"

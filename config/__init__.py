@@ -132,6 +132,19 @@ class CoordinateMappingConfig:
     target: CoordinateRange = field(default_factory=CoordinateRange)
 
 
+@dataclass
+class DatasetConfig:
+    """数据集配置（LeRobot）"""
+    repo_id: str = ""                       # 数据集名称/ID (空字符串表示使用时间戳)
+    instruction: str = "Real robot teleoperation"  # 任务描述
+    fps: int = 30                           # 视频帧率
+    data_root: str = "real_robot_data"      # 数据保存根目录
+    action_dim: int = 13                    # 动作维度
+    state_dim: int = 13                     # 状态维度
+    image_height: int = 480                 # 图像高度
+    image_width: int = 640                  # 图像宽度
+
+
 class Config:
     """
     配置管理器
@@ -149,6 +162,7 @@ class Config:
         self.control = ControlConfig()
         self.gripper = GripperConfig()
         self.coordinate_mapping = CoordinateMappingConfig()
+        self.dataset = DatasetConfig()
         self.debug = False
         self._raw_config: Dict[str, Any] = {}
     
@@ -302,6 +316,17 @@ class Config:
             z_min=target_range.get("z_min", 0.1),
             z_max=target_range.get("z_max", 0.4)
         )
+        
+        # 数据集配置
+        dataset = raw.get("dataset", {})
+        self.dataset.repo_id = dataset.get("repo_id", "")  # 空字符串表示使用时间戳
+        self.dataset.instruction = dataset.get("instruction", "Real robot teleoperation")
+        self.dataset.fps = dataset.get("fps", 30)
+        self.dataset.data_root = dataset.get("data_root", "real_robot_data")
+        self.dataset.action_dim = dataset.get("action_dim", 13)
+        self.dataset.state_dim = dataset.get("state_dim", 13)
+        self.dataset.image_height = dataset.get("image_height", 480)
+        self.dataset.image_width = dataset.get("image_width", 640)
     
     def get(self, key: str, default: Any = None) -> Any:
         """获取原始配置值"""

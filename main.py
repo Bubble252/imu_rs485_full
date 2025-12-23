@@ -108,6 +108,7 @@ class IMUArmController:
         self._episode_frame_count = 0
         self._last_recording_command = None
         self._recording_start_time = 0.0
+        self._use_fixed_repo_id = False  # 是否使用固定的 repo_id（命令行指定）
         
     def setup(self) -> bool:
         """
@@ -904,9 +905,13 @@ class IMUArmController:
             self._recording_state = "recording"
             self._episode_frame_count = 0
             self._recording_start_time = time.time()
+            
+            # 简化版：只发送 "start" 命令，数据集配置由 B 端管理
             self._last_recording_command = "start"
+            
             print(f"\n{'='*70}")
-            print("🔴 开始录制 Episode")
+            print(f"🔴 开始录制 Episode")
+            print(f"📝 任务: {config.dataset.instruction}")
             print(f"{'='*70}\n")
     
     def _end_recording(self):
@@ -1088,17 +1093,25 @@ class IMUArmController:
 
 
 def main():
+    from datetime import datetime
+    
     parser = argparse.ArgumentParser(
         description='IMU机械臂控制系统',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-    python main.py                        # 使用默认配置
-    python main.py --config custom.yaml   # 使用自定义配置文件
+    python main.py                              # 使用默认配置，repo_id为当前时间戳
+    python main.py --repo-id my_dataset         # 指定数据集ID
+    python main.py --repo-id exp_001 --instruction "Pick and place task"
+    python main.py --config custom.yaml         # 使用自定义配置文件
+    
+数据集参数:
+    --repo-id: 数据集名称/ID (默认: 当前时间 YYYYMMDD_HHMMSS)
+    --instruction: 任务描述 (默认: 配置文件中的值)
+    --fps: 视频帧率 (默认: 配置文件中的值)
     
 配置文件:
-    所有参数都在 config/settings.yaml 中配置
-    无需复杂命令行参数
+    其他参数在 config/settings.yaml 中配置
         """
     )
     parser.add_argument(
@@ -1107,6 +1120,24 @@ def main():
         default=None,
         help='配置文件路径 (默认: config/settings.yaml)'
     )
+    parser.add_argument(
+        '--repo-id', '-r',
+        type=str,
+        default=None,
+        help='数据集ID/名称 (默认: 当前时间戳 YYYYMMDD_HHMMSS)'
+    )
+    parser.add_argument(
+        '--instruction', '-i',
+        type=str,
+        default=None,
+        help='任务描述/指令'
+    )
+    parser.add_argument(
+        '--fps',
+        type=int,
+        default=None,
+        help='视频帧率'
+    )
     
     args = parser.parse_args()
     
@@ -1114,8 +1145,33 @@ def main():
     if args.config:
         config.load(args.config)
     
+    # 判断是否使用固定的 repo_id
+    use_fixed_repo_id = False
+    
+    # 命令行参数覆盖配置文件中的数据集设置
+    if args.repo_id:
+        config.dataset.repo_id = args.repo_id
+        use_fixed_repo_id = True  # 命令行指定了，使用固定 ID
+    
+    if args.instruction:
+        config.dataset.instruction = args.instruction
+    
+    if args.fps:
+        config.dataset.fps = args.fps
+    
+    # 打印数据集配置
+    print(f"\n📊 数据集配置:")
+    if use_fixed_repo_id:
+        print(f"   ID: {config.dataset.repo_id} (固定)")
+    else:
+        print(f"   ID: 每次录制自动生成时间戳")
+    print(f"   描述: {config.dataset.instruction}")
+    print(f"   FPS: {config.dataset.fps}")
+    print()
+    
     # 创建控制器
     controller = IMUArmController()
+    controller._use_fixed_repo_id = use_fixed_repo_id  # 设置是否使用固定 ID
     
     # 信号处理
     def signal_handler(sig, frame):
