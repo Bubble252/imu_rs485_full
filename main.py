@@ -84,7 +84,7 @@ class IMUArmController:
         # 当前状态
         self._current_raw_coords = (0.0, 0.0, 0.0, 0.0, 0.0)
         self._current_clipped_coords = (0.0, 0.0, 0.0, 0.0, 0.0)
-        self._current_euler = {"imu1": {}, "imu2": {}, "imu3": {}}
+        self._current_euler = {"imu1": {}, "imu2": {}, "imu3": {}, "imu4": {}}
         
         # 发布间隔
         self._publish_interval = 1.0 / config.control.publish_rate
@@ -109,6 +109,10 @@ class IMUArmController:
         self._last_recording_command = None
         self._recording_start_time = 0.0
         self._use_fixed_repo_id = False  # 是否使用固定的 repo_id（命令行指定）
+        
+        # 夹爪控制来源: "imu" 或 "keyboard"
+        self._gripper_control_source = "keyboard"
+        self._gripper_imu_value = 0.0  # 陀螺仪计算的夹爪值
         
     def setup(self) -> bool:
         """
@@ -265,6 +269,7 @@ class IMUArmController:
         print(f"IMU 1 (杆1): 地址 0x50 (80)  │  长度: {config.arm.L1*1000:.0f} mm")
         print(f"IMU 2 (杆2): 地址 0x51 (81)  │  长度: {config.arm.L2*1000:.0f} mm")
         print(f"IMU 3 (机械爪): 地址 0x52 (82)")
+        print(f"IMU 4 (手指): 地址 0x54 (84)")
         print("─" * W)
         
         # ZMQ 连接信息
@@ -319,7 +324,8 @@ class IMUArmController:
     
     def _print_status_display(self, euler1: dict, euler2: dict, euler3: dict,
                                raw_pos: tuple, mapped_pos: tuple, 
-                               gripper_val: float, actual_rate: float):
+                               gripper_val: float, actual_rate: float,
+                               euler4: dict = None):
         """
         打印优雅的终端状态显示（借鉴 triple 的风格）
         
@@ -330,15 +336,21 @@ class IMUArmController:
         
         W = self.BOX_WIDTH
         
+        # 默认 euler4
+        if euler4 is None:
+            euler4 = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
+        
         # IMU 在线状态
         imu1_online = self.imu.is_online(0x50)
         imu2_online = self.imu.is_online(0x51)
         imu3_online = self.imu.is_online(0x52)
+        imu4_online = self.imu.is_online(0x54)
         
         # Yaw 偏移
         yaw1_offset = self.imu.get_yaw_offset(0x50)
         yaw2_offset = self.imu.get_yaw_offset(0x51)
         yaw3_offset = self.imu.get_yaw_offset(0x52)
+        yaw4_offset = self.imu.get_yaw_offset(0x54)
         
         # ========== IMU 1 ==========
         print("┌" + "─" * W + "┐")
@@ -363,6 +375,31 @@ class IMUArmController:
         yaw3_str = f"(偏移:{yaw3_offset:.2f}°)" if yaw3_offset is not None else "(未归零)"
         print(f"│ 状态: {status3}".ljust(W+1) + "│")
         print(f"│ Roll = {euler3.get('roll', 0):8.2f}°  │  Pitch = {euler3.get('pitch', 0):8.2f}°  │  Yaw = {euler3.get('yaw', 0):8.2f}° {yaw3_str}".ljust(W+17) + "│")
+        
+        # ========== IMU 4 (手指) ==========
+        print("├" + "─" * W + "┤")
+        print(f"│ IMU 4 (手指) - 地址: 0x54 (84)".ljust(W+1) + "│")
+        status4 = "✅ 在线" if imu4_online else "⚠️  离线"
+        yaw4_str = f"(偏移:{yaw4_offset:.2f}°)" if yaw4_offset is not None else "(未归零)"
+        print(f"│ 状态: {status4}".ljust(W+1) + "│")
+        print(f"│ Roll = {euler4.get('roll', 0):8.2f}°  │  Pitch = {euler4.get('pitch', 0):8.2f}°  │  Yaw = {euler4.get('yaw', 0):8.2f}° {yaw4_str}".ljust(W+17) + "│")
+        
+        # ========== Pitch 差值 (机械爪 vs 手指) ==========
+        print("├" + "─" * W + "┤")
+        pitch3 = euler3.get('pitch', 0)
+        pitch4 = euler4.get('pitch', 0)
+        pitch_diff_raw = abs(pitch3 - pitch4)
+        # Clip 到 30-130 范围
+        pitch_diff_clipped = max(30, min(130, pitch_diff_raw))
+        # 缩放到 1~0 区间 (30→1, 130→0)
+        gripper_normalized = 1.0 - (pitch_diff_clipped - 30) / 100.0
+        
+        # 根据控制来源显示不同样式
+        if self._gripper_control_source == "imu":
+            ctrl_indicator = "🟢 IMU控制中"
+        else:
+            ctrl_indicator = "⚪ 未启用(键盘控制)"
+        print(f"│ 🤏 手指张合: |{pitch3:.1f}° - {pitch4:.1f}°| = {pitch_diff_raw:.1f}° → {gripper_normalized:.3f}  {ctrl_indicator}".ljust(W+5) + "│")
         print("└" + "─" * W + "┘")
         
         # ========== 末端位置 & 发布状态 ==========
@@ -384,12 +421,18 @@ class IMUArmController:
         sent_yaw = np.deg2rad(euler3.get('yaw', 0))
         print(f"│ 发送姿态: Roll={sent_roll:7.4f}, Pitch={sent_pitch:7.4f}, Yaw={sent_yaw:7.4f} rad".ljust(W+1) + "│")
         
-        # 夹爪状态（进度条）
+        # 夹爪状态（进度条）+ 控制来源
         gripper_percent = gripper_val * 100
         bar_len = 20
         filled = int(gripper_val * bar_len)
         gripper_bar = "█" * filled + "░" * (bar_len - filled)
-        print(f"│ 🦾 夹爪开合: [{gripper_bar}] {gripper_percent:5.1f}%".ljust(W+3) + "│")
+        
+        # 显示控制来源
+        if self._gripper_control_source == "imu":
+            source_icon = "🎛️ IMU"
+        else:
+            source_icon = "⌨️ 键盘"
+        print(f"│ 🦾 夹爪开合: [{gripper_bar}] {gripper_percent:5.1f}%  ({source_icon})".ljust(W+5) + "│")
         
         print("├" + "─" * W + "┤")
         
@@ -497,9 +540,14 @@ class IMUArmController:
                     "pitch": self.imu.get_euler(0x52, "pitch"),
                     "yaw": self.imu.get_normalized_yaw(0x52),
                 }
+                euler4 = {
+                    "roll": self.imu.get_euler(0x54, "roll"),
+                    "pitch": self.imu.get_euler(0x54, "pitch"),
+                    "yaw": self.imu.get_normalized_yaw(0x54),
+                }
                 
                 # 保存当前欧拉角（用于显示）
-                self._current_euler = {"imu1": euler1, "imu2": euler2, "imu3": euler3}
+                self._current_euler = {"imu1": euler1, "imu2": euler2, "imu3": euler3, "imu4": euler4}
                 
                 # ========== 步骤3: 计算末端位置 ==========
                 try:
@@ -510,8 +558,26 @@ class IMUArmController:
                     print(f"⚠️  运动学计算失败: {e}")
                     end_pos = np.array([0.0, 0.0, 0.0])
                 
-                # 获取夹爪值
-                gripper_value = self.gripper.value
+                # ========== 步骤3.5: 计算夹爪值 (IMU4 或 键盘) ==========
+                # 检查 IMU4 (0x54) 是否配置且在线
+                imu4_configured = 'imu4' in config.imu.addresses
+                imu4_online = self.imu.is_online(0x54) if imu4_configured else False
+                
+                if imu4_configured and imu4_online:
+                    # 使用陀螺仪 Pitch 差值控制夹爪
+                    pitch3 = euler3["pitch"]
+                    pitch4 = euler4["pitch"]
+                    pitch_diff_raw = abs(pitch3 - pitch4)
+                    # Clip 到 30-130 范围
+                    pitch_diff_clipped = max(30, min(130, pitch_diff_raw))
+                    # 缩放到 1~0 区间 (30→1, 130→0)
+                    gripper_value = 1.0 - (pitch_diff_clipped - 30) / 100.0
+                    self._gripper_control_source = "imu"
+                    self._gripper_imu_value = gripper_value
+                else:
+                    # 使用键盘控制夹爪
+                    gripper_value = self.gripper.value
+                    self._gripper_control_source = "keyboard"
                 
                 # 原始坐标
                 raw_x, raw_y, raw_z = end_pos[0], end_pos[1], end_pos[2]
@@ -555,11 +621,13 @@ class IMUArmController:
                         "imu1": euler1,
                         "imu2": euler2,
                         "imu3": euler3,
+                        "imu4": euler4,
                     },
                     "status": {
                         "imu1_online": imu1_online,
                         "imu2_online": imu2_online,
                         "imu3_online": imu3_online,
+                        "imu4_online": self.imu.is_online(0x54),
                     }
                 }
                 
@@ -605,7 +673,8 @@ class IMUArmController:
                         (raw_x, raw_y, raw_z),
                         mapped[:3],
                         gripper_value,
-                        actual_rate
+                        actual_rate,
+                        euler4  # 新增 IMU4 数据
                     )
                     
                     # 重置统计
@@ -641,6 +710,7 @@ class IMUArmController:
                 euler1 = self.imu.get_euler_dict(0x50)
                 euler2 = self.imu.get_euler_dict(0x51)
                 euler3 = self.imu.get_euler_dict(0x52)
+                euler4 = self.imu.get_euler_dict(0x54)  # 新增 IMU4 (手指)
                 
                 # 每2秒打印一次调试信息
                 if current_time - last_debug_print > 2.0:
@@ -651,6 +721,7 @@ class IMUArmController:
                 imu1_online = self.imu.is_online(0x50)
                 imu2_online = self.imu.is_online(0x51)
                 imu3_online = self.imu.is_online(0x52)
+                imu4_online = self.imu.is_online(0x54)  # 新增 IMU4
                 
                 # 获取视频帧 (如果有)
                 video_left = self.video.get_latest_frame('left') if hasattr(self.video, 'get_latest_frame') else None
@@ -684,6 +755,11 @@ class IMUArmController:
                         "pitch": float(euler3["pitch"]),
                         "yaw": float(euler3["yaw"])
                     },
+                    "imu4": {
+                        "roll": float(euler4["roll"]),
+                        "pitch": float(euler4["pitch"]),
+                        "yaw": float(euler4["yaw"])
+                    },
                     "position": {
                         "raw": list(self._current_raw_coords) if self._current_raw_coords else [0.0, 0.0, 0.0],
                         "mapped": list(self._current_clipped_coords) if self._current_clipped_coords else [0.0, 0.0, 0.0]
@@ -692,7 +768,8 @@ class IMUArmController:
                     "online_status": {
                         "imu1": imu1_online,
                         "imu2": imu2_online,
-                        "imu3": imu3_online
+                        "imu3": imu3_online,
+                        "imu4": imu4_online
                     },
                     "stats": {
                         "publish_count": publish_count,

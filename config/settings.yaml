@@ -26,6 +26,7 @@ imu:
     imu1: 0x50                    # 80 - 杆1
     imu2: 0x51                    # 81 - 杆2  
     imu3: 0x52                    # 82 - 机械爪
+    imu4: 0x54                    # 84 - 手指
   
   # Yaw归零模式: "NORMAL" / "AUTO" / "SIMPLE" / "OFF"
   yaw_normalization_mode: "NORMAL"
