@@ -410,6 +410,10 @@ class IMUArmController:
         print(f"│ 原始位置: [{raw_pos[0]:7.3f}, {raw_pos[1]:7.3f}, {raw_pos[2]:7.3f}] m".ljust(W+1) + "│")
         print(f"│ 映射位置: [{mapped_pos[0]:7.3f}, {mapped_pos[1]:7.3f}, {mapped_pos[2]:7.3f}] m".ljust(W+1) + "│")
         
+        # 发送的 x 值（水平距离 = sqrt(x^2 + y^2)）
+        sent_x = 0.52-(0.52-pow(raw_pos[0]*raw_pos[0] + raw_pos[1]*raw_pos[1], 0.5))*2
+        print(f"│ 📏 发送X (水平距离): {sent_x:.4f} m = {sent_x*1000:.1f} mm".ljust(W+1) + "│")
+        
         # Shoulder Pan 角度
         shoulder_pan = np.arctan2(raw_pos[1], raw_pos[0])
         shoulder_pan_deg = np.rad2deg(shoulder_pan)
@@ -530,6 +534,7 @@ class IMUArmController:
                     "pitch": self.imu.get_euler(0x50, "pitch"),
                     "yaw": self.imu.get_normalized_yaw(0x50),
                 }
+                euler1["yaw"]=euler1["yaw"]*2  # IMU1 Yaw 放大 2 倍以增强控制灵敏度
                 euler2 = {
                     "roll": self.imu.get_euler(0x51, "roll"),
                     "pitch": self.imu.get_euler(0x51, "pitch"),
@@ -599,7 +604,7 @@ class IMUArmController:
                         "shoulder_pan": float(np.arctan2(raw_y, raw_x)),
                         "wrist_roll": float(np.deg2rad(euler3["roll"])),
                         "pitch": float(np.deg2rad(euler3["pitch"])),
-                        "x": float(pow(end_pos[0]*end_pos[0]+end_pos[1]*end_pos[1], 0.5)),
+                        "x": 0.52-(0.52-float(pow(end_pos[0]*end_pos[0]+end_pos[1]*end_pos[1], 0.5)))*2,  # x 坐标系转换
                         "y": float(end_pos[2]),  # z -> y 坐标系转换
                         "gripper": float(gripper_value),
                     },
